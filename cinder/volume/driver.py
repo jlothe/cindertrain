@@ -312,18 +312,12 @@ image_opts = [
     cfg.BoolOpt('use_multipath_for_image_xfer',
                 default=False,
                 help='Do we attach/detach volumes in cinder using multipath '
-                     'for volume to image and image to volume transfers? '
-                     'This parameter needs to be configured for each backend '
-                     'section or in [backend_defaults] section as a common '
-                     'configuration for all backends.'),
+                     'for volume to image and image to volume transfers?'),
     cfg.BoolOpt('enforce_multipath_for_image_xfer',
                 default=False,
                 help='If this is set to True, attachment of volumes for '
                      'image transfer will be aborted when multipathd is not '
-                     'running. Otherwise, it will fallback to single path. '
-                     'This parameter needs to be configured for each backend '
-                     'section or in [backend_defaults] section as a common '
-                     'configuration for all backends.'),
+                     'running. Otherwise, it will fallback to single path.'),
 ]
 fqdn_opts = [
     cfg.BoolOpt('unique_fqdn_network',

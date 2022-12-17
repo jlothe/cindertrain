@@ -2518,26 +2518,11 @@ class HPE3PARCommon(object):
                     type_info['hpe3par_keys'])
                 # make the 3PAR copy the contents.
                 # can't delete the original until the copy is done.
-                task_id = self._copy_volume(snapshot['name'], vol_name, cpg=cpg,
+                self._copy_volume(snapshot['name'], vol_name, cpg=cpg,
                                   snap_cpg=type_info['snap_cpg'],
                                   tpvv=type_info['tpvv'],
                                   tdvv=type_info['tdvv'],
                                   compression=compression_val)
-
-                # Wait till the clone operation completes.
-                LOG.debug('Copy volume scheduled: convert_to_base_volume: '
-                          'id=%s.', volume['id'])
-               
-                task_status = self._wait_for_task_completion(task_id)
-               
-                if task_status['status'] is not self.client.TASK_DONE:
-                    dbg = {'status': task_status, 'id': volume['id']}
-                    msg = _('Copy volume task failed: convert_to_base_volume: '
-                            'id=%(id)s, status=%(status)s.') % dbg
-                    raise exception.CinderException(msg)
-                else:
-                    LOG.debug('Copy volume completed: convert_to_base_volume: '
-                              'id=%s.', volume['id'])
 
                 if qos or vvs_name or flash_cache is not None:
                     try:
@@ -3235,18 +3220,78 @@ class HPE3PARCommon(object):
             attachment_list = volume.volume_attachment
             LOG.debug("Volume attachment list: %(atl)s",
                       {'atl': attachment_list})
+
+            LOG.debug("hostname: %(hst)s", {'hst': hostname})
             try:
                 attachment_list = attachment_list.objects
             except AttributeError:
                 pass
 
             if attachment_list is not None and len(attachment_list) > 1:
-                LOG.info("Volume %(volume)s is attached to multiple "
-                         "instances on host %(host_name)s, "
-                         "skip terminate volume connection",
+                # There are two possibilities: the instances can reside:
+                # [1] either on same host.
+                # [2] or on different hosts.
+                #
+                # case [1]:
+                # In such case, behaviour is same as earlier i.e vlun is
+                # not deleted now i.e skip remainder of terminate volume
+                # connection.
+                #
+                # case [2]:
+                # In such case, vlun of that host on 3par array should
+                # be deleted now. Otherwise, it remains as stale entry on
+                # 3par array; which later leads to error during volume
+                # deletion.
+
+                same_host = False
+                num_hosts = len(attachment_list)
+                all_hostnames = []
+
+                count = 0
+                for i in range(num_hosts):
+                    hostname_i = str(attachment_list[i].attached_host)
+                    LOG.debug("hostname_[%(i)s]: %(hostname_i)s",
+                              {'i': i, 'hostname_i': hostname_i})
+
+                    if (hostname_i.find(hostname) != -1):
+                        # hostname_i contains substring hostname
+                        # current host
+                        all_hostnames.append(hostname_i)
+                        count = count + 1
+                        if count > 1:
+                            # volume attached to multiple instances on
+                            # current host
+                            same_host = True
+                    else:
+                        # hostname_i does NOT contain substring hostname
+                        # different host
+                        all_hostnames.append(hostname_i)
+
+                all_hosts_str = ",".join(all_hostnames)
+                LOG.debug("all_hostnames: %(all_hosts_str)s",
+                          {'all_hosts_str': all_hosts_str})
+                if same_host:
+                    LOG.info("Volume %(volume)s is attached to multiple "
+                             "instances on same host %(host_name)s, "
+                             "skip terminate volume connection",
+                             {'volume': volume.name,
+                              'host_name': volume.host.split('@')[0]})
+                    return
+                else:
+                    hostnames = ",".join(all_hostnames)
+                    LOG.info("Volume %(volume)s is attached to instances "
+                             "on multiple hosts %(hostnames)s. Proceed with "
+                             "deletion of vlun on this host i.e %(this_host)s",
+                             {'volume': volume.name, 'hostnames': hostnames,
+                              'this_host': hostname})
+
+            if attachment_list is not None and len(attachment_list) == 1:
+                hostname_i = str(attachment_list[0].attached_host)
+                LOG.info("Volume %(volume)s is attached to "
+                         "instance on single host %(host_name)s, Proceed with "
+                         "deletion of vlun on this host.",
                          {'volume': volume.name,
-                          'host_name': volume.host.split('@')[0]})
-                return
+                          'host_name': hostname_i})
 
         # does 3par know this host by a different name?
         hosts = None
@@ -3260,6 +3305,7 @@ class HPE3PARCommon(object):
                 hostname = hosts['members'][0]['name']
 
         try:
+            LOG.debug("Calling delete_vlun")
             self.delete_vlun(volume, hostname, wwn=wwn, iqn=iqn,
                              remote_client=remote_client)
             return
