@@ -2352,10 +2352,7 @@ class HPE3PARCommon(object):
                     LOG.error("Exception: %s", ex)
                     raise exception.CinderException(ex)
 
-            if (self._volume_of_replicated_type(volume,
-                                                hpe_tiramisu_check=True)
-               and self._do_volume_replication_setup(volume)):
-                replication_flag = True
+           
 
         except hpeexceptions.HTTPConflict:
             msg = _("Volume (%s) already exists on array") % volume_name
@@ -2591,6 +2588,14 @@ class HPE3PARCommon(object):
                 else:
                     LOG.debug('Copy volume completed: create_cloned_volume: '
                               'id=%s.', volume['id'])
+               
+                # v2 replication check
+                replication_flag = False
+                if (self._volume_of_replicated_type(volume,
+                                                    hpe_tiramisu_check=True)
+                   and self._do_volume_replication_setup(volume)):
+                    replication_flag = True
+
 
                 return model_update
 
