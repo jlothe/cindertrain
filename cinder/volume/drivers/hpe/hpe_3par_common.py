@@ -2352,7 +2352,126 @@ class HPE3PARCommon(object):
                     LOG.error("Exception: %s", ex)
                     raise exception.CinderException(ex)
 
-           
+            if (self._volume_of_replicated_type(volume,
+                                                hpe_tiramisu_check=True)
+               and self._do_volume_replication_setup(volume)):
+                replication_flag = True 
+
+        except hpeexceptions.HTTPConflict:
+            msg = _("Volume (%s) already exists on array") % volume_name
+            LOG.error(msg)
+            raise exception.Duplicate(msg)
+        except hpeexceptions.HTTPBadRequest as ex:
+            LOG.error("Exception: %s", ex)
+            raise exception.Invalid(ex.get_description())
+        except exception.InvalidInput as ex:
+            LOG.error("Exception: %s", ex)
+            raise
+        except exception.CinderException as ex:
+            LOG.error("Exception: %s", ex)
+            raise
+        except Exception as ex:
+            LOG.error("Exception: %s", ex)
+            raise exception.CinderException(ex)
+
+        return self._get_model_update(volume['host'], cpg,
+                                      replication=replication_flag,
+                                      provider_location=self.client.id,
+                                      hpe_tiramisu=hpe_tiramisu)
+
+    def _create_volume_2(self, volume):
+        LOG.debug('_CREATE VOLUME 2 (%(disp_name)s: %(vol_name)s %(id)s on '
+                  '%(host)s)',
+                  {'disp_name': volume['display_name'],
+                   'vol_name': volume['name'],
+                   'id': self._get_3par_vol_name(volume),
+                   'host': volume['host']})
+        try:
+            comments = {'volume_id': volume['id'],
+                        'name': volume['name'],
+                        'type': 'OpenStack'}
+            self._add_name_id_to_comment(comments, volume)
+
+            # This flag denotes group level replication on
+            # hpe 3par.
+            hpe_tiramisu = False
+            name = volume.get('display_name', None)
+            if name:
+                comments['display_name'] = name
+
+            # get the options supported by volume types
+            type_info = self.get_volume_settings_from_type(volume)
+            volume_type = type_info['volume_type']
+            vvs_name = type_info['vvs_name']
+            qos = type_info['qos']
+            cpg = type_info['cpg']
+            snap_cpg = type_info['snap_cpg']
+            tpvv = type_info['tpvv']
+            tdvv = type_info['tdvv']
+            flash_cache = self.get_flash_cache_policy(
+                type_info['hpe3par_keys'])
+            compression = self.get_compression_policy(
+                type_info['hpe3par_keys'])
+
+            consis_group_snap_type = False
+            if volume_type is not None:
+                consis_group_snap_type = self.is_volume_group_snap_type(
+                    volume_type)
+
+            cg_id = volume.get('group_id', None)
+            group = volume.get('group', None)
+            if cg_id and consis_group_snap_type:
+                vvs_name = self._get_3par_vvs_name(cg_id)
+
+            type_id = volume.get('volume_type_id', None)
+            if type_id is not None:
+                comments['volume_type_name'] = volume_type.get('name')
+                comments['volume_type_id'] = type_id
+                if vvs_name is not None:
+                    comments['vvs'] = vvs_name
+                else:
+                    comments['qos'] = qos
+
+            extras = {'comment': json.dumps(comments),
+                      'snapCPG': snap_cpg,
+                      'tpvv': tpvv}
+
+            # Only set the dedup option if the backend supports it.
+            if self.API_VERSION >= DEDUP_API_VERSION:
+                extras['tdvv'] = tdvv
+
+            capacity = self._capacity_from_size(volume['size'])
+            volume_name = self._get_3par_vol_name(volume)
+
+            if compression is not None:
+                extras['compression'] = compression
+
+            self.client.createVolume(volume_name, cpg, capacity, extras)
+            # v2 replication check
+            replication_flag = False
+
+            if consis_group_snap_type:
+                if (self._volume_of_hpe_tiramisu_type(volume)):
+                    hpe_tiramisu = True
+
+            # Add volume to remote group.
+            if (group is not None and hpe_tiramisu):
+                if group.is_replicated:
+                    self._check_rep_status_enabled_on_group(group)
+                    self._add_vol_to_remote_group(group, volume)
+                    replication_flag = True
+
+            if qos or vvs_name or flash_cache is not None:
+                try:
+                    self._add_volume_to_volume_set(volume, volume_name,
+                                                   cpg, vvs_name, qos,
+                                                   flash_cache)
+                except exception.InvalidInput as ex:
+                    # Delete the volume if unable to add it to the volume set
+                    self.client.deleteVolume(volume_name)
+                    LOG.error("Exception: %s", ex)
+                    raise exception.CinderException(ex)
+
 
         except hpeexceptions.HTTPConflict:
             msg = _("Volume (%s) already exists on array") % volume_name
@@ -2572,7 +2691,7 @@ class HPE3PARCommon(object):
                 LOG.debug("Creating a clone of volume, using non-online copy.")
 
                 # we first have to create the destination volume
-                model_update = self.create_volume(volume)
+                model_update = self._create_volume_2(volume)
 
                 optional = {'priority': 1}
                 body = self.client.copyVolume(src_vol_name, vol_name, None,
