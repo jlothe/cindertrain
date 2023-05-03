@@ -1339,7 +1339,7 @@ class HPE3PARCommon(object):
         # change all our unit tests), and ORM (because we some methods still
         # pass it, such as terminate_connection).
         if isinstance(volume_id, (objects.Volume, objects.Volume.model, dict)):
-            volume_id = volume_id.get('_name_id') or volume_id['id']
+            volume_id = volume_id['id'] or volume_id.get('_name_id')
         volume_name = cls._encode_name(volume_id)
         if temp_vol:
             # is this a temporary volume
@@ -2727,6 +2727,13 @@ class HPE3PARCommon(object):
             raise exception.CinderException(ex)
 
     def delete_volume(self, volume):
+        osv_vol_name = self._get_3par_vol_name(volume)
+        vol_id = volume['id']
+        LOG.debug("DELETE volume osv_name: %(osv)s, vol_id: %(id)s",
+                  {'osv': osv_vol_name, 'id': vol_id})
+        if volume['volume_type_id']:
+            LOG.debug("volume_type_id: %(type_id)s",
+                      {'type_id': volume['volume_type_id']})
 
         @utils.retry(exception.VolumeIsBusy, interval=2, retries=10)
         def _try_remove_volume(volume_name):
@@ -2743,6 +2750,8 @@ class HPE3PARCommon(object):
         # method of deconstructing the volume and its dependencies
         if self._volume_of_replicated_type(volume, hpe_tiramisu_check=True):
             replication_status = volume.get('replication_status', None)
+            LOG.debug("replication_status: %(status)s",
+                      {'status': replication_status}) 
             if replication_status and replication_status == "failed-over":
                 self._delete_replicated_failed_over_volume(volume)
             else:
@@ -4545,15 +4554,39 @@ class HPE3PARCommon(object):
         -Delete Remote Copy Group from main array
         -Delete volume from main array
         """
+        LOG.debug("inside _do_volume_replication_destroy")
+
         if not rcg_name:
             rcg_name = self._get_3par_rcg_name(volume)
         vol_name = self._get_3par_vol_name(volume)
 
+        LOG.debug("vol_name: %(vol_name)s, rcg_name: %(rcg_name)s",
+                  {'vol_name': vol_name, 'rcg_name': rcg_name})
+
         # Stop remote copy.
         try:
             self.client.stopRemoteCopy(rcg_name)
-        except Exception:
-            pass
+        except Exception as ex:
+            #pass
+            LOG.debug("exception during stopRemoteCopy: %(ex)s", {'ex': ex})
+            if ex.get_code() == 187:
+                # remote copy group does not exist
+
+                # if non-replicated volume is retyped or migrated to replicated vol,
+                # then rcg_name is different. Try to get that new rcg_name.
+                vvset_name = self.client.findVolumeSet(vol_name)
+                LOG.debug("Returned vvset_name = %s", vvset_name)
+                if vvset_name is not None:
+                    if vvset_name.startswith('RCP_rcg'):
+                        # eg. RCP_rcg-CArwlBBhRqq3K-eLUh
+                        rcg_name = vvset_name.split('RCP_')[1]
+                        LOG.debug("new rcg_name: %(name)s",
+                                  {'name': rcg_name})
+
+                        try:
+                            self.client.stopRemoteCopy(rcg_name)
+                        except Exception:
+                            pass
 
         # Delete volume from remote copy group on main array.
         try:
