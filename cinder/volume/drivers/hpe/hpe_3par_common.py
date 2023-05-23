@@ -3734,7 +3734,8 @@ class HPE3PARCommon(object):
         old_tpvv = old_volume_info['provisioningType'] == self.THIN
         old_tdvv = old_volume_info['provisioningType'] == self.DEDUP
         old_cpg = old_volume_info['userCPG']
-        old_comment = old_volume_info['comment']
+        old_comment = old_volume_info.get('comment', '')
+        LOG.debug("old_comment: %s", old_comment)
         old_snap_cpg = None
         if 'snapCPG' in old_volume_info:
             old_snap_cpg = old_volume_info['snapCPG']
@@ -5381,7 +5382,11 @@ class ModifyVolumeTask(flow_utils.CinderTask):
                          new_type_name, new_type_id):
 
         # Modify the comment during ModifyVolume
-        comment_dict = dict(ast.literal_eval(old_comment))
+        if old_comment == '':
+            comment_dict = {}
+        else:
+            comment_dict = dict(ast.literal_eval(old_comment))
+        LOG.debug("comment_dict: %s", str(comment_dict))
         if 'vvs' in comment_dict:
             del comment_dict['vvs']
         if 'qos' in comment_dict:
