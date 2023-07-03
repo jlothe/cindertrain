@@ -1339,7 +1339,7 @@ class HPE3PARCommon(object):
         # change all our unit tests), and ORM (because we some methods still
         # pass it, such as terminate_connection).
         if isinstance(volume_id, (objects.Volume, objects.Volume.model, dict)):
-            volume_id = volume_id['id'] or volume_id.get('_name_id')
+            volume_id = volume_id.get('_name_id') or volume_id['id']
         volume_name = cls._encode_name(volume_id)
         if temp_vol:
             # is this a temporary volume
@@ -2729,11 +2729,20 @@ class HPE3PARCommon(object):
     def delete_volume(self, volume):
         osv_vol_name = self._get_3par_vol_name(volume)
         vol_id = volume['id']
-        LOG.debug("DELETE volume osv_name: %(osv)s, vol_id: %(id)s",
-                  {'osv': osv_vol_name, 'id': vol_id})
+        name_id = volume.get('_name_id')
+        LOG.debug("DELETE volume osv_name: %(osv)s, vol_id: %(id)s, name_id: %(name_id)s",
+                  {'osv': osv_vol_name, 'id': vol_id, 'name_id': name_id})
         if volume['volume_type_id']:
             LOG.debug("volume_type_id: %(type_id)s",
                       {'type_id': volume['volume_type_id']})
+
+        LOG.debug("status: %(status)s, previous_status: %(previous_status)s,"
+                  " migration_status: %(migration_status)s ",
+                  {'status': volume['status'], 'previous_status': volume['previous_status'],
+                   'migration_status': volume['migration_status']})
+
+        if self._volume_of_replicated_type(volume, hpe_tiramisu_check=True):
+            LOG.debug("volume is of replicated_type")
 
         @utils.retry(exception.VolumeIsBusy, interval=2, retries=10)
         def _try_remove_volume(volume_name):
@@ -4535,7 +4544,7 @@ class HPE3PARCommon(object):
 
             return True
         except Exception as ex:
-            self._do_volume_replication_destroy(volume)
+            self._do_volume_replication_destroy(volume, retype=retype)
             msg = (_("There was an error setting up a remote copy group "
                      "on the 3PAR arrays: ('%s'). The volume will not be "
                      "recognized as replication type.") %
@@ -4560,6 +4569,14 @@ class HPE3PARCommon(object):
         if not rcg_name:
             rcg_name = self._get_3par_rcg_name(volume)
         vol_name = self._get_3par_vol_name(volume)
+
+        if (volume['migration_status'] == 'deleting' and
+           volume['status'] == 'deleting'):
+            # don't use current osv_name (which was from name_id)
+            # get new osv_name from id
+            LOG.debug("get osv_name from volume id")
+            vol_name = self._encode_name(volume['id'])
+            vol_name = "osv-" + vol_name
 
         LOG.debug("vol_name: %(vol_name)s, rcg_name: %(rcg_name)s",
                   {'vol_name': vol_name, 'rcg_name': rcg_name})
@@ -4603,6 +4620,8 @@ class HPE3PARCommon(object):
             pass
 
         # Delete volume on the main array.
+        LOG.debug("RT: retype: %(retype)s",
+                  {'retype': retype})
         try:
             if not retype:
                 self.client.deleteVolume(vol_name)
