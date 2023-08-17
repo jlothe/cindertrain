@@ -1373,9 +1373,22 @@ class HPE3PARCommon(object):
 
     # v2 replication conversion
     def _get_3par_rcg_name(self, volume):
-        rcg_name = self._encode_name(volume.get('_name_id') or volume['id'])
-        rcg = "rcg-%s" % rcg_name
-        return rcg[:22]
+        # if non-replicated volume is retyped or migrated to replicated vol,
+        # then rcg_name is different. Try to get that new rcg_name.
+        if volume['migration_status'] == 'success':
+            vol_name = self._get_3par_vol_name(volume)
+            vol_details = self.client.getVolume(vol_name)
+            rcg_name = vol_details.get('rcopyGroup')
+
+            LOG.debug("new rcg_name: %(name)s",
+                      {'name': rcg_name})
+            return rcg_name
+        else:
+            # by default, rcg_name is similar to volume name
+            rcg_name = self._encode_name(volume.get('_name_id')
+                                         or volume['id'])
+            rcg = "rcg-%s" % rcg_name
+            return rcg[:22]
 
     def _get_3par_remote_rcg_name(self, volume, provider_location):
         return self._get_3par_rcg_name(volume) + ".r" + (
@@ -2727,22 +2740,13 @@ class HPE3PARCommon(object):
             raise exception.CinderException(ex)
 
     def delete_volume(self, volume):
-        osv_vol_name = self._get_3par_vol_name(volume)
         vol_id = volume['id']
         name_id = volume.get('_name_id')
-        LOG.debug("DELETE volume osv_name: %(osv)s, vol_id: %(id)s, name_id: %(name_id)s",
-                  {'osv': osv_vol_name, 'id': vol_id, 'name_id': name_id})
-        if volume['volume_type_id']:
-            LOG.debug("volume_type_id: %(type_id)s",
-                      {'type_id': volume['volume_type_id']})
+        LOG.debug("DELETE volume vol_id: %(vol_id)s, name_id: %(name_id)s",
+                  {'vol_id': vol_id, 'name_id': name_id})
 
-        LOG.debug("status: %(status)s, previous_status: %(previous_status)s,"
-                  " migration_status: %(migration_status)s ",
-                  {'status': volume['status'], 'previous_status': volume['previous_status'],
-                   'migration_status': volume['migration_status']})
-
-        if self._volume_of_replicated_type(volume, hpe_tiramisu_check=True):
-            LOG.debug("volume is of replicated_type")
+        LOG.debug("migration_status: %(migration_status)s",
+                  {'migration_status': volume['migration_status']})
 
         @utils.retry(exception.VolumeIsBusy, interval=2, retries=10)
         def _try_remove_volume(volume_name):
@@ -2758,17 +2762,30 @@ class HPE3PARCommon(object):
         # If the volume type is replication enabled, we want to call our own
         # method of deconstructing the volume and its dependencies
         if self._volume_of_replicated_type(volume, hpe_tiramisu_check=True):
+            LOG.debug("volume is of replicated_type")
             replication_status = volume.get('replication_status', None)
             LOG.debug("replication_status: %(status)s",
                       {'status': replication_status}) 
-            if replication_status and replication_status == "failed-over":
-                self._delete_replicated_failed_over_volume(volume)
-            else:
-                self._do_volume_replication_destroy(volume)
-            return
+            if replication_status:
+                if replication_status == "failed-over":
+                    self._delete_replicated_failed_over_volume(volume)
+                else:
+                    self._do_volume_replication_destroy(volume)
+                return
 
+        volume_name = self._get_3par_vol_name(volume)
+
+        # during retype/migrate
+        if (self._volume_of_replicated_type(volume, hpe_tiramisu_check=True)
+           and volume['migration_status'] == 'deleting'):
+            # don't use current osv_name (which was from name_id)
+            # get new osv_name from id
+            LOG.debug("get osv_name from volume id")
+            volume_name = self._encode_name(volume['id'])
+            volume_name = "osv-" + volume_name
+
+        LOG.debug("volume_name: %(name)s", {'name': volume_name})
         try:
-            volume_name = self._get_3par_vol_name(volume)
             # Try and delete the volume, it might fail here because
             # the volume is part of a volume set which will have the
             # volume set name in the error.
@@ -3127,6 +3144,39 @@ class HPE3PARCommon(object):
                 log_error('original', e, temp_name, current_name, temp_name)
         return True
 
+    def _rename_migrated_vvset(self, src_volume, dest_volume):
+        """Rename the vvsets after a migration.
+
+        """
+        vvs_name_src = self._get_3par_vvs_name(src_volume['id'])
+        vvs_name_dest = self._get_3par_vvs_name(dest_volume['id'])
+
+        # There can be parallel execution. Ensure that temp_vvs_name is unique
+        # eg. if vvs_name_src is: vvs-DK3sEwkPTCqVHdHKHtwZBA
+        # then temp_vvs_name is : tos-DK3sEwkPTCqVHdHKHtwZBA
+        temp_vvs_name = 'tos-' + vvs_name_src[4:]
+
+        try:
+            LOG.debug("Renaming vvset %(old)s to %(new)s",
+                      {'old': vvs_name_dest, 'new': temp_vvs_name})
+            self.client.modifyVolumeSet(vvs_name_dest, newName=temp_vvs_name)
+        except Exception as ex:
+            LOG.error("exception: %(details)s", {'details': str(ex)})
+
+        try:
+            LOG.debug("Renaming vvset %(old)s to %(new)s",
+                      {'old': vvs_name_src, 'new': vvs_name_dest})
+            self.client.modifyVolumeSet(vvs_name_src, newName=vvs_name_dest)
+        except Exception as ex:
+            LOG.error("exception: %(details)s", {'details': str(ex)})
+
+        try:
+            LOG.debug("Renaming vvset %(old)s to %(new)s",
+                      {'old': temp_vvs_name, 'new': vvs_name_src})
+            self.client.modifyVolumeSet(temp_vvs_name, newName=vvs_name_src)
+        except Exception as ex:
+            LOG.error("exception: %(details)s", {'details': str(ex)})
+
     def update_migrated_volume(self, context, volume, new_volume,
                                original_volume_status):
         """Rename the new (temp) volume to it's original name.
@@ -3158,6 +3208,13 @@ class HPE3PARCommon(object):
             current_name = self._get_3par_vol_name(new_volume)
             self._update_comment(current_name, volume_id=volume['id'],
                                  _name_id=name_id)
+
+        if new_volume_renamed:
+            type_info = self.get_volume_settings_from_type(volume)
+            qos = type_info['qos']
+            if qos:
+                # rename the vvsets as per volume names
+                self._rename_migrated_vvset(volume, new_volume)
 
         return {'_name_id': name_id, 'provider_location': provider_location}
 
@@ -4570,41 +4627,14 @@ class HPE3PARCommon(object):
             rcg_name = self._get_3par_rcg_name(volume)
         vol_name = self._get_3par_vol_name(volume)
 
-        if (volume['migration_status'] == 'deleting' and
-           volume['status'] == 'deleting'):
-            # don't use current osv_name (which was from name_id)
-            # get new osv_name from id
-            LOG.debug("get osv_name from volume id")
-            vol_name = self._encode_name(volume['id'])
-            vol_name = "osv-" + vol_name
-
         LOG.debug("vol_name: %(vol_name)s, rcg_name: %(rcg_name)s",
                   {'vol_name': vol_name, 'rcg_name': rcg_name})
 
         # Stop remote copy.
         try:
             self.client.stopRemoteCopy(rcg_name)
-        except Exception as ex:
-            #pass
-            LOG.debug("exception during stopRemoteCopy: %(ex)s", {'ex': ex})
-            if ex.get_code() == 187:
-                # remote copy group does not exist
-
-                # if non-replicated volume is retyped or migrated to replicated vol,
-                # then rcg_name is different. Try to get that new rcg_name.
-                vvset_name = self.client.findVolumeSet(vol_name)
-                LOG.debug("Returned vvset_name = %s", vvset_name)
-                if vvset_name is not None:
-                    if vvset_name.startswith('RCP_rcg'):
-                        # eg. RCP_rcg-CArwlBBhRqq3K-eLUh
-                        rcg_name = vvset_name.split('RCP_')[1]
-                        LOG.debug("new rcg_name: %(name)s",
-                                  {'name': rcg_name})
-
-                        try:
-                            self.client.stopRemoteCopy(rcg_name)
-                        except Exception:
-                            pass
+        except Exception:
+            pass
 
         # Delete volume from remote copy group on main array.
         try:
@@ -4620,8 +4650,7 @@ class HPE3PARCommon(object):
             pass
 
         # Delete volume on the main array.
-        LOG.debug("RT: retype: %(retype)s",
-                  {'retype': retype})
+        LOG.debug("retype: %(retype)s", {'retype': retype})
         try:
             if not retype:
                 self.client.deleteVolume(vol_name)
@@ -4663,20 +4692,29 @@ class HPE3PARCommon(object):
     def _delete_vvset(self, volume):
 
         # volume is part of a volume set.
+        LOG.debug("_delete_vvset. vol_id: %(id)s", {'id': volume['id']})
         volume_name = self._get_3par_vol_name(volume)
         vvset_name = self.client.findVolumeSet(volume_name)
-        LOG.debug("Returned vvset_name = %s", vvset_name)
-        if vvset_name is not None:
-            if vvset_name.startswith('vvs-'):
-                # We have a single volume per volume set, so
-                # remove the volume set.
-                self.client.deleteVolumeSet(
-                    self._get_3par_vvs_name(volume['id']))
-            else:
-                # We have a pre-defined volume set just remove the
-                # volume and leave the volume set.
-                self.client.removeVolumeFromVolumeSet(vvset_name,
-                                                      volume_name)
+
+        try:
+            # find vvset
+            self.client.getVolumeSet(vvset_name)
+
+            # (a) vvset is found:
+            # We have a single volume per volume set, so
+            # remove the volume set.
+            LOG.debug("Deleting vvset: %(name)s", {'name': vvset_name})
+            self.client.deleteVolumeSet(vvset_name)
+
+        except hpeexceptions.HTTPNotFound:
+            # (b) vvset not found:
+            # - find the vvset name from volume name
+            # - remove the volume and leave the vvset
+            vvset_name = self.client.findVolumeSet(volume_name)
+
+            LOG.debug("Removing vol %(volume_name)s from vvset %(vvset_name)s",
+                      {'volume_name': volume_name, 'vvset_name': vvset_name})
+            self.client.removeVolumeFromVolumeSet(vvset_name, volume_name)
 
     def _get_3par_rcg_name_of_group(self, group_id):
         rcg_name = self._encode_name(group_id)
